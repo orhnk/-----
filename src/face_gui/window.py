@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Tuple
 
 import cv2
+import fitz
 import mediapipe as mp
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -72,6 +73,368 @@ _PERSISTED_FIELDS: Tuple[str, ...] = (
 _MAX_KERNEL_SIZE = 31
 
 
+class _PdfProcessingCancelled(Exception):
+    """Internal exception used to unwind PDF processing when cancelled."""
+
+
+def _create_face_mesh_for_config(
+    config: DetectionConfig,
+    *,
+    static_image_mode: bool,
+) -> mp.solutions.face_mesh.FaceMesh | None:
+    if not config.enable_face_mask:
+        return None
+
+    max_faces = max(int(config.max_faces), 1)
+    try:
+        return mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=static_image_mode,
+            max_num_faces=max_faces,
+            refine_landmarks=True,
+            min_detection_confidence=float(np.clip(config.detection_confidence, 0.0, 1.0)),
+            min_tracking_confidence=float(np.clip(config.tracking_confidence, 0.0, 1.0)),
+        )
+    except Exception as exc:  # pragma: no cover - initialization failure
+        raise RuntimeError("Unable to initialize MediaPipe Face Mesh.") from exc
+
+
+def _create_body_segmenter_for_config(
+    config: DetectionConfig,
+) -> mp.solutions.selfie_segmentation.SelfieSegmentation | None:
+    if not config.enable_body_mask:
+        return None
+
+    try:
+        return mp.solutions.selfie_segmentation.SelfieSegmentation(
+            model_selection=int(np.clip(config.segmentation_model_selection, 0, 1))
+        )
+    except Exception as exc:  # pragma: no cover - initialization failure
+        raise RuntimeError("Unable to initialize MediaPipe Selfie Segmentation.") from exc
+
+
+def _apply_face_mask_to_frame(
+    frame: np.ndarray,
+    config: DetectionConfig,
+    mesh: mp.solutions.face_mesh.FaceMesh | None,
+) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if height == 0 or width == 0 or mesh is None or not config.enable_face_mask:
+        return frame
+
+    frame.flags.writeable = False
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = mesh.process(rgb_frame)
+    frame.flags.writeable = True
+
+    if not getattr(results, "multi_face_landmarks", None):
+        return frame
+
+    color = config.mask_color
+    alpha = float(np.clip(config.mask_alpha, 0.0, 1.0))
+    border = max(config.border_thickness, 0)
+
+    polygons = []
+    for face_landmarks in results.multi_face_landmarks:
+        points: list[tuple[int, int]] = []
+        for index in _FACE_OVAL_LANDMARKS:
+            try:
+                landmark = face_landmarks.landmark[index]
+            except IndexError:
+                continue
+            x = int(np.clip(landmark.x * width, 0, max(width - 1, 0)))
+            y = int(np.clip(landmark.y * height, 0, max(height - 1, 0)))
+            points.append((x, y))
+        if len(points) >= 3:
+            polygons.append(np.array(points, dtype=np.int32))
+
+    if not polygons:
+        return frame
+
+    if alpha >= 0.999:
+        for polygon in polygons:
+            cv2.fillPoly(frame, [polygon], color)
+            if border > 0:
+                cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=border)
+        return frame
+
+    overlay = frame.copy()
+    for polygon in polygons:
+        cv2.fillPoly(overlay, [polygon], color)
+
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+
+    if border > 0:
+        for polygon in polygons:
+            cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=border)
+
+    return frame
+
+
+def _apply_body_mask_to_frame(
+    frame: np.ndarray,
+    config: DetectionConfig,
+    segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None,
+    previous_buffer: Optional[np.ndarray],
+) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    if segmenter is None or not config.enable_body_mask:
+        return frame, None
+
+    height, width = frame.shape[:2]
+    if height == 0 or width == 0:
+        return frame, None
+
+    frame.flags.writeable = False
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = segmenter.process(rgb_frame)
+    frame.flags.writeable = True
+
+    segmentation_mask: Optional[np.ndarray] = getattr(results, "segmentation_mask", None)
+    if segmentation_mask is None:
+        return frame, None
+
+    mask_prob = np.asarray(segmentation_mask, dtype=np.float32)
+    smooth_factor = float(np.clip(config.segmentation_smooth_factor, 0.0, 0.99))
+    if smooth_factor > 0 and previous_buffer is not None:
+        mask_prob = smooth_factor * previous_buffer + (1.0 - smooth_factor) * mask_prob
+
+    kernel_size = max(int(config.segmentation_kernel_size), 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    if kernel_size >= 3:
+        mask_prob = cv2.GaussianBlur(mask_prob, (kernel_size, kernel_size), sigmaX=0, sigmaY=0)
+    mask_prob = np.clip(mask_prob, 0.0, 1.0)
+
+    threshold = float(np.clip(config.segmentation_threshold, 0.0, 1.0))
+    mask = mask_prob > threshold
+    if mask.any() and kernel_size >= 3:
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        mask_uint8 = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=1)
+        mask = mask_uint8.astype(bool)
+
+    if not np.any(mask):
+        return frame, None
+
+    color = np.array(config.mask_color, dtype=np.float32)
+    alpha = float(np.clip(config.mask_alpha, 0.0, 1.0))
+
+    if alpha >= 0.999:
+        frame[mask] = color.astype(np.uint8)
+        return frame, mask_prob
+
+    existing = frame[mask].astype(np.float32)
+    blended = alpha * color + (1.0 - alpha) * existing
+    frame[mask] = blended.clip(0, 255).astype(np.uint8)
+    return frame, mask_prob
+
+
+def _render_page_to_bgr(page: fitz.Page, matrix: fitz.Matrix) -> np.ndarray:
+    pixmap = page.get_pixmap(matrix=matrix, colorspace=fitz.csRGB, alpha=False)
+    data = np.frombuffer(pixmap.samples, dtype=np.uint8)
+    components = pixmap.n
+    if components not in {3, 4}:
+        raise RuntimeError("Unsupported color space in PDF page image.")
+    array = data.reshape(pixmap.height, pixmap.width, components)
+    if components == 4:
+        array = array[:, :, :3]
+    return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+
+
+def _encode_bgr_image(frame: np.ndarray) -> bytes:
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise RuntimeError("Processed frame must be a color image.")
+    success, encoded = cv2.imencode(".png", frame)
+    if not success:
+        raise RuntimeError("Unable to encode processed frame for PDF insertion.")
+    return encoded.tobytes()
+
+
+def _parse_page_selection(spec: str, total_pages: int) -> list[int]:
+    cleaned = spec.strip()
+    if not cleaned:
+        return list(range(total_pages))
+
+    pages: set[int] = set()
+    tokens = [token.strip() for token in cleaned.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("Page selection is empty.")
+
+    for token in tokens:
+        if "-" in token:
+            start_str, end_str = token.split("-", 1)
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError as exc:  # pragma: no cover - validation error path
+                raise ValueError(f"Invalid page range '{token}'.") from exc
+            if start <= 0 or end <= 0:
+                raise ValueError("Page numbers must be positive.")
+            if end < start:
+                start, end = end, start
+            for page in range(start, end + 1):
+                if 1 <= page <= total_pages:
+                    pages.add(page - 1)
+        else:
+            try:
+                page = int(token)
+            except ValueError as exc:  # pragma: no cover - validation error path
+                raise ValueError(f"Invalid page number '{token}'.") from exc
+            if page <= 0 or page > total_pages:
+                raise ValueError(f"Page {page} is outside the document range (1-{total_pages}).")
+            pages.add(page - 1)
+
+    if not pages:
+        raise ValueError("No valid pages selected.")
+    return sorted(pages)
+
+
+class PdfProcessWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, int)
+    message = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(str, bool, object)
+
+    def __init__(
+        self,
+        input_path: Path,
+        output_path: Path,
+        config: DetectionConfig,
+        page_indices: Optional[list[int]],
+        scale: float,
+    ) -> None:
+        super().__init__()
+        self._input_path = input_path
+        self._output_path = output_path
+        self._config = DetectionConfig(**asdict(config))
+        self._page_indices = page_indices
+        self._scale = max(scale, 0.5)
+        self._cancelled = False
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            self._process()
+        except _PdfProcessingCancelled:
+            self.finished.emit(str(self._output_path), False, "Processing cancelled by user.")
+        except Exception as exc:  # pragma: no cover - unexpected failure path
+            self.finished.emit(str(self._output_path), False, str(exc))
+        else:
+            self.finished.emit(str(self._output_path), True, None)
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def _process(self) -> None:
+        self.message.emit(f"Opening {self._input_path.name}…")
+
+        doc = fitz.open(self._input_path)
+        face_mesh: mp.solutions.face_mesh.FaceMesh | None = None
+        body_segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None = None
+        out_doc: fitz.Document | None = None
+
+        try:
+            page_count = doc.page_count
+            if page_count == 0:
+                raise RuntimeError("The PDF appears to be empty.")
+
+            if self._page_indices is None:
+                targets = list(range(page_count))
+            else:
+                targets = [index for index in self._page_indices if 0 <= index < page_count]
+                if not targets:
+                    raise RuntimeError("No valid pages matched the selection.")
+
+            target_set = set(targets)
+            total_targets = len(targets)
+
+            face_mesh = _create_face_mesh_for_config(self._config, static_image_mode=True)
+            body_segmenter = _create_body_segmenter_for_config(self._config)
+            matrix = fitz.Matrix(self._scale, self._scale)
+
+            out_doc = fitz.open()
+            processed_count = 0
+
+            for page_index in range(page_count):
+                if self._cancelled:
+                    raise _PdfProcessingCancelled()
+
+                page = doc.load_page(page_index)
+                should_process = page_index in target_set
+
+                if not should_process:
+                    out_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+                    continue
+
+                frame = _render_page_to_bgr(page, matrix)
+                frame, _ = _apply_body_mask_to_frame(frame, self._config, body_segmenter, None)
+                frame = _apply_face_mask_to_frame(frame, self._config, face_mesh)
+
+                image_stream = _encode_bgr_image(frame)
+                new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
+                new_page.insert_image(
+                    new_page.rect,
+                    stream=image_stream,
+                    keep_proportion=False,
+                    overlay=False,
+                )
+
+                processed_count += 1
+                self.progress.emit(processed_count, total_targets)
+                percent = (processed_count / total_targets) * 100.0
+                self.message.emit(f"Page {page_index + 1}/{page_count} processed • {percent:4.1f}% complete")
+
+            self.message.emit("Saving sanitized PDF…")
+            out_doc.save(self._output_path, deflate=True)
+            self.message.emit(f"Saved PDF to {self._output_path}")
+        finally:
+            if out_doc is not None:
+                out_doc.close()
+            if face_mesh is not None:
+                face_mesh.close()
+            if body_segmenter is not None:
+                body_segmenter.close()
+            doc.close()
+
+
+class _PdfDropFrame(QtWidgets.QFrame):
+    file_dropped = QtCore.pyqtSignal(Path)
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setObjectName("pdfDropFrame")
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:  # noqa: N802
+        if self._has_pdf(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:  # noqa: N802
+        mime = event.mimeData()
+        if mime is None:
+            super().dropEvent(event)
+            return
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            candidate = Path(url.toLocalFile())
+            if candidate.suffix.lower() == ".pdf" and candidate.exists():
+                self.file_dropped.emit(candidate)
+                event.acceptProposedAction()
+                return
+        super().dropEvent(event)
+
+    @staticmethod
+    def _has_pdf(mime: Optional[QtCore.QMimeData]) -> bool:
+        if mime is None or not mime.hasUrls():
+            return False
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            if Path(url.toLocalFile()).suffix.lower() == ".pdf":
+                return True
+        return False
+
+
 class FaceDetectionWindow(QtWidgets.QMainWindow):
     def __init__(self, config: DetectionConfig) -> None:
         super().__init__()
@@ -111,6 +474,20 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
         self._image_original_bgr: Optional[np.ndarray] = None
         self._image_last_directory: Optional[Path] = None
+
+        self._pdf_input_path: Optional[Path] = None
+        self._pdf_open_button: QtWidgets.QPushButton | None = None
+        self._pdf_path_display: QtWidgets.QLineEdit | None = None
+        self._pdf_page_entry: QtWidgets.QLineEdit | None = None
+        self._pdf_resolution_combo: QtWidgets.QComboBox | None = None
+        self._pdf_process_button: QtWidgets.QPushButton | None = None
+        self._pdf_cancel_button: QtWidgets.QPushButton | None = None
+        self._pdf_progress_bar: QtWidgets.QProgressBar | None = None
+        self._pdf_log: QtWidgets.QPlainTextEdit | None = None
+        self._pdf_thread: QtCore.QThread | None = None
+        self._pdf_worker: PdfProcessWorker | None = None
+        self._pdf_last_directory: Optional[Path] = None
+        self._pdf_resume_stream_after = False
 
         self._load_persisted_settings()
 
@@ -329,22 +706,123 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
     def _build_pdf_tab(self, parent: QtWidgets.QWidget) -> QtWidgets.QWidget:
         tab = QtWidgets.QWidget(parent)
-        layout = QtWidgets.QVBoxLayout(tab)
-        layout.setContentsMargins(32, 32, 32, 32)
-        layout.setSpacing(16)
+        tab.setObjectName("pdfTab")
 
-        header = QtWidgets.QLabel("PDF mode (coming soon)", tab)
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(28, 28, 28, 28)
+        layout.setSpacing(18)
+
+        header = QtWidgets.QLabel("PDF anonymizer", tab)
         header.setStyleSheet("font-size: 20px; font-weight: 600;")
         layout.addWidget(header)
 
-        message = QtWidgets.QLabel(
-            "Drop your design ideas here—PDF redaction will live in this workspace in the next milestone.",
+        subtitle = QtWidgets.QLabel(
+            "Block human faces and bodies across entire documents using the same detection parameters as the other modes.",
             tab,
         )
-        message.setWordWrap(True)
-        message.setStyleSheet("color: #5c6a79; font-size: 14px;")
-        layout.addWidget(message)
-        layout.addStretch(1)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("color: #5c6a79; font-size: 14px;")
+        layout.addWidget(subtitle)
+
+        drop_frame = _PdfDropFrame(tab)
+        drop_frame.setMinimumHeight(160)
+        drop_frame.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        drop_frame.setStyleSheet(
+            "#pdfDropFrame { border: 2px dashed #31404d; border-radius: 16px; background-color: rgba(30, 40, 50, 0.35); }"
+        )
+        drop_layout = QtWidgets.QVBoxLayout(drop_frame)
+        drop_layout.setContentsMargins(24, 24, 24, 24)
+        drop_layout.setSpacing(8)
+
+        drop_title = QtWidgets.QLabel("Drop a PDF to start anonymizing", drop_frame)
+        drop_title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        drop_title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        drop_layout.addWidget(drop_title)
+
+        drop_hint = QtWidgets.QLabel(
+            "You can also choose a file below. Page selection defaults to the entire document unless specified.",
+            drop_frame,
+        )
+        drop_hint.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        drop_hint.setWordWrap(True)
+        drop_hint.setStyleSheet("color: #6c7a89;")
+        drop_layout.addWidget(drop_hint)
+
+        layout.addWidget(drop_frame)
+        drop_frame.file_dropped.connect(self._on_pdf_drop)
+
+        file_row = QtWidgets.QHBoxLayout()
+        file_row.setSpacing(12)
+
+        self._pdf_open_button = QtWidgets.QPushButton("Choose PDF…", tab)
+        self._pdf_open_button.clicked.connect(self._on_pdf_open_clicked)
+        file_row.addWidget(self._pdf_open_button)
+
+        self._pdf_path_display = QtWidgets.QLineEdit(tab)
+        self._pdf_path_display.setPlaceholderText("No document selected")
+        self._pdf_path_display.setReadOnly(True)
+        self._pdf_path_display.setObjectName("pdfPathDisplay")
+        file_row.addWidget(self._pdf_path_display, stretch=1)
+
+        layout.addLayout(file_row)
+
+        options_group = QtWidgets.QGroupBox("Processing options", tab)
+        options_form = QtWidgets.QFormLayout(options_group)
+        options_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+        self._pdf_page_entry = QtWidgets.QLineEdit(options_group)
+        self._pdf_page_entry.setPlaceholderText("Example: 1-5, 8, 10-12 (leave blank for all pages)")
+        self._pdf_page_entry.setClearButtonEnabled(True)
+        self._pdf_page_entry.textChanged.connect(self._on_pdf_options_changed)
+        options_form.addRow("Pages", self._pdf_page_entry)
+
+        self._pdf_resolution_combo = QtWidgets.QComboBox(options_group)
+        self._pdf_resolution_combo.addItem("Fast (96 dpi)", 96 / 72)
+        self._pdf_resolution_combo.addItem("Balanced (144 dpi)", 2.0)
+        self._pdf_resolution_combo.addItem("Studio (216 dpi)", 216 / 72)
+        self._pdf_resolution_combo.setCurrentIndex(1)
+        options_form.addRow("Render quality", self._pdf_resolution_combo)
+
+        layout.addWidget(options_group)
+
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setSpacing(12)
+
+        self._pdf_process_button = QtWidgets.QPushButton("Process & Export", tab)
+        self._pdf_process_button.setEnabled(False)
+        self._pdf_process_button.clicked.connect(self._on_pdf_process_clicked)
+        control_row.addWidget(self._pdf_process_button)
+
+        self._pdf_cancel_button = QtWidgets.QPushButton("Cancel", tab)
+        self._pdf_cancel_button.setVisible(False)
+        self._pdf_cancel_button.clicked.connect(self._on_pdf_cancel_clicked)
+        control_row.addWidget(self._pdf_cancel_button)
+
+        control_row.addStretch(1)
+        layout.addLayout(control_row)
+
+        self._pdf_progress_bar = QtWidgets.QProgressBar(tab)
+        self._pdf_progress_bar.setRange(0, 100)
+        self._pdf_progress_bar.setValue(0)
+        self._pdf_progress_bar.setFormat("Idle")
+        layout.addWidget(self._pdf_progress_bar)
+
+        self._pdf_log = QtWidgets.QPlainTextEdit(tab)
+        self._pdf_log.setReadOnly(True)
+        self._pdf_log.setMinimumHeight(160)
+        self._pdf_log.setPlaceholderText("Progress updates will appear here…")
+        layout.addWidget(self._pdf_log, stretch=1)
+
+        footer = QtWidgets.QLabel(
+            "Tip: tweak detection parameters from the Camera tab—the PDF processor shares the same configuration.",
+            tab,
+        )
+        footer.setWordWrap(True)
+        footer.setStyleSheet("color: #5c6a79; font-size: 12px;")
+        layout.addWidget(footer)
+
+        self._update_pdf_controls_state()
+
         return tab
 
     def _on_mode_changed(self, index: int) -> None:
@@ -379,7 +857,12 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
                 else:
                     self._status_label.setText("Image mode: paste or open an image")
             else:
-                self._status_label.setText("PDF mode under construction")
+                if self._pdf_worker is not None:
+                    self._status_label.setText("PDF mode: processing…")
+                elif self._pdf_input_path is not None:
+                    self._status_label.setText(f"PDF mode ready: {self._pdf_input_path.name}")
+                else:
+                    self._status_label.setText("PDF mode: drop or choose a PDF")
 
     def _register_shortcuts(self) -> None:
         self._paste_shortcut = QtWidgets.QShortcut(QtGui.QKeySequence.StandardKey.Paste, self)
@@ -616,6 +1099,268 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         if self.config.enable_face_mask:
             result = self._annotate_faces_with_mesh(result, self._face_mesh)
         return result
+
+    def _activate_pdf_mode(self) -> None:
+        if self._tab_widget is None or self._pdf_tab_index < 0:
+            return
+        if self._tab_widget.currentIndex() != self._pdf_tab_index:
+            self._tab_widget.setCurrentIndex(self._pdf_tab_index)
+        if self._pdf_page_entry is not None:
+            self._pdf_page_entry.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def _on_pdf_drop(self, path: Path) -> None:
+        if not path.exists():
+            QtWidgets.QMessageBox.warning(self, "PDF mode", f"{path} could not be found.")
+            return
+        self._activate_pdf_mode()
+        self._assign_pdf_input(path)
+
+    def _on_pdf_open_clicked(self) -> None:
+        start_dir = self._pdf_last_directory or (
+            self._pdf_input_path.parent if self._pdf_input_path is not None else Path.home()
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select PDF",
+            str(start_dir),
+            "PDF files (*.pdf);;All files (*)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        self._pdf_last_directory = path.parent
+        self._activate_pdf_mode()
+        self._assign_pdf_input(path)
+
+    def _assign_pdf_input(self, path: Path) -> None:
+        if not path.exists() or path.suffix.lower() != ".pdf":
+            QtWidgets.QMessageBox.warning(self, "PDF mode", "Select a valid PDF document.")
+            return
+        self._pdf_input_path = path
+        self._pdf_last_directory = path.parent
+        if self._pdf_path_display is not None:
+            self._pdf_path_display.setText(str(path))
+            self._pdf_path_display.setCursorPosition(0)
+        if self._pdf_progress_bar is not None and self._pdf_worker is None:
+            self._pdf_progress_bar.setRange(0, 100)
+            self._pdf_progress_bar.setValue(0)
+            self._pdf_progress_bar.setFormat("Ready")
+        self._append_pdf_log(f"Selected {path.name}")
+        self._status_label.setText(f"PDF mode ready: {path.name}")
+        self._update_pdf_controls_state()
+
+    def _on_pdf_options_changed(self, _: str) -> None:
+        self._update_pdf_controls_state()
+
+    def _update_pdf_controls_state(self) -> None:
+        has_path = self._pdf_input_path is not None and self._pdf_input_path.exists()
+        worker_active = self._pdf_worker is not None
+
+        for widget in (self._pdf_open_button, self._pdf_page_entry, self._pdf_resolution_combo, self._pdf_process_button):
+            if widget is None:
+                continue
+            if widget is self._pdf_process_button:
+                widget.setEnabled(has_path and not worker_active)
+            else:
+                widget.setEnabled(not worker_active)
+
+        if self._pdf_cancel_button is not None:
+            self._pdf_cancel_button.setVisible(worker_active)
+            self._pdf_cancel_button.setEnabled(worker_active)
+
+        if self._pdf_progress_bar is not None and not worker_active and not has_path:
+            self._pdf_progress_bar.setRange(0, 100)
+            self._pdf_progress_bar.setValue(0)
+            self._pdf_progress_bar.setFormat("Idle")
+
+    def _append_pdf_log(self, message: str) -> None:
+        if self._pdf_log is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self._pdf_log.appendPlainText(f"[{timestamp}] {message}")
+        scrollbar = self._pdf_log.verticalScrollBar()
+        if scrollbar is not None:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def _clear_pdf_log(self) -> None:
+        if self._pdf_log is not None:
+            self._pdf_log.clear()
+
+    def _on_pdf_process_clicked(self) -> None:
+        if self._pdf_worker is not None:
+            return
+        if self._pdf_input_path is None or not self._pdf_input_path.exists():
+            QtWidgets.QMessageBox.information(self, "PDF mode", "Choose a PDF before processing.")
+            self._update_pdf_controls_state()
+            return
+
+        input_path = self._pdf_input_path
+
+        try:
+            with fitz.open(input_path) as doc:
+                total_pages = doc.page_count
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "PDF mode", f"Unable to open PDF.\n{exc}")
+            return
+
+        if total_pages == 0:
+            QtWidgets.QMessageBox.warning(self, "PDF mode", "The selected PDF does not contain pages.")
+            return
+
+        page_text = self._pdf_page_entry.text() if self._pdf_page_entry is not None else ""
+        page_indices: Optional[list[int]]
+        if page_text.strip():
+            try:
+                page_indices = _parse_page_selection(page_text, total_pages)
+            except ValueError as exc:
+                QtWidgets.QMessageBox.warning(self, "PDF mode", str(exc))
+                return
+        else:
+            page_indices = None
+
+        default_name = input_path.with_name(f"{input_path.stem}-anonymized.pdf")
+        start_dir = self._pdf_last_directory or input_path.parent
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export PDF",
+            str(default_name if default_name.parent.exists() else start_dir / default_name.name),
+            "PDF files (*.pdf)",
+        )
+        if not filename:
+            return
+        output_path = Path(filename)
+        if output_path.exists():
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite file?",
+                f"{output_path.name} already exists. Overwrite it?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        if output_path.resolve() == input_path.resolve():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "PDF mode",
+                "Please choose a different filename to avoid overwriting the original document while it is open.",
+            )
+            return
+
+        self._pdf_last_directory = output_path.parent
+
+        scale = 2.0
+        if self._pdf_resolution_combo is not None:
+            data = self._pdf_resolution_combo.currentData()
+            try:
+                scale = float(data)
+            except (TypeError, ValueError):
+                scale = 2.0
+
+        self._clear_pdf_log()
+        self._append_pdf_log("Preparing anonymization pipeline…")
+        if self._pdf_progress_bar is not None:
+            self._pdf_progress_bar.setRange(0, 100)
+            self._pdf_progress_bar.setValue(0)
+            self._pdf_progress_bar.setFormat("0% • pending")
+
+        self._pdf_resume_stream_after = hasattr(self, "_timer") and self._timer.isActive()
+        if self._pdf_resume_stream_after:
+            self._stop_streaming()
+
+        self._pdf_worker = PdfProcessWorker(input_path, output_path, self.config, page_indices, scale)
+        self._pdf_thread = QtCore.QThread(self)
+        self._pdf_worker.moveToThread(self._pdf_thread)
+        self._pdf_thread.started.connect(self._pdf_worker.run)
+        self._pdf_worker.progress.connect(self._on_pdf_worker_progress)
+        self._pdf_worker.message.connect(self._on_pdf_worker_message)
+        self._pdf_worker.finished.connect(self._on_pdf_worker_finished)
+        self._pdf_worker.finished.connect(self._pdf_thread.quit)
+        self._pdf_worker.finished.connect(self._pdf_worker.deleteLater)
+        self._pdf_thread.finished.connect(self._on_pdf_worker_thread_finished)
+        self._pdf_thread.start()
+
+        if self._pdf_process_button is not None:
+            self._pdf_process_button.setEnabled(False)
+        if self._pdf_cancel_button is not None:
+            self._pdf_cancel_button.setVisible(True)
+            self._pdf_cancel_button.setEnabled(True)
+            self._pdf_cancel_button.setText("Cancel")
+        self._append_pdf_log("Anonymization started…")
+        self._status_label.setText("PDF mode: processing…")
+        self._update_pdf_controls_state()
+
+    def _on_pdf_cancel_clicked(self) -> None:
+        if self._pdf_worker is None:
+            return
+        self._pdf_worker.cancel()
+        if self._pdf_cancel_button is not None:
+            self._pdf_cancel_button.setEnabled(False)
+            self._pdf_cancel_button.setText("Cancelling…")
+        self._append_pdf_log("Cancellation requested. Finishing current page…")
+
+    def _on_pdf_worker_progress(self, processed: int, total: int) -> None:
+        if self._pdf_progress_bar is None:
+            return
+        if total <= 0:
+            self._pdf_progress_bar.setRange(0, 0)
+            self._pdf_progress_bar.setFormat("Processing…")
+            return
+        self._pdf_progress_bar.setRange(0, 100)
+        percent = 100.0 * processed / max(total, 1)
+        self._pdf_progress_bar.setValue(min(int(round(percent)), 100))
+        self._pdf_progress_bar.setFormat(f"{percent:4.1f}% • {processed}/{total} pages")
+        if self._status_label is not None:
+            self._status_label.setText(f"PDF mode: {percent:4.1f}% complete")
+
+    def _on_pdf_worker_message(self, message: str) -> None:
+        self._append_pdf_log(message)
+
+    def _on_pdf_worker_finished(self, output_path: str, success: bool, error: Optional[str]) -> None:
+        if self._pdf_cancel_button is not None:
+            self._pdf_cancel_button.setText("Cancel")
+            self._pdf_cancel_button.setVisible(False)
+            self._pdf_cancel_button.setEnabled(True)
+
+        if self._pdf_progress_bar is not None:
+            if success:
+                self._pdf_progress_bar.setValue(100)
+                self._pdf_progress_bar.setFormat("100% • Completed")
+            else:
+                self._pdf_progress_bar.setValue(0)
+                self._pdf_progress_bar.setFormat("Idle")
+
+        if success:
+            self._append_pdf_log(f"Completed. Output saved to {output_path}")
+            QtWidgets.QMessageBox.information(
+                self,
+                "PDF anonymized",
+                f"An anonymized copy was saved to:\n{output_path}",
+            )
+            self._status_label.setText("PDF mode: export complete")
+        else:
+            message = error or "An unexpected error occurred"
+            self._append_pdf_log(message)
+            if error and "cancelled" in error.lower():
+                QtWidgets.QMessageBox.information(self, "PDF mode", "Processing cancelled.")
+                self._status_label.setText("PDF mode: cancelled")
+            else:
+                QtWidgets.QMessageBox.warning(self, "PDF mode", message)
+                self._status_label.setText("PDF mode: ready")
+
+        self._update_pdf_controls_state()
+
+        if self._pdf_resume_stream_after and getattr(self, "_timer", None) is not None:
+            self._start_streaming()
+        self._pdf_resume_stream_after = False
+
+    def _on_pdf_worker_thread_finished(self) -> None:
+        if self._pdf_thread is not None:
+            self._pdf_thread.deleteLater()
+        self._pdf_thread = None
+        self._pdf_worker = None
+        self._update_pdf_controls_state()
+
 
     @staticmethod
     def _qimage_to_bgr(image: QtGui.QImage) -> np.ndarray:
@@ -1324,18 +2069,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         if not self.config.enable_face_mask:
             return
 
-        max_faces = max(int(self.config.max_faces), 1)
-        try:
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=max_faces,
-                refine_landmarks=True,
-                min_detection_confidence=float(np.clip(self.config.detection_confidence, 0.0, 1.0)),
-                min_tracking_confidence=float(np.clip(self.config.tracking_confidence, 0.0, 1.0)),
-            )
-        except Exception as exc:  # pragma: no cover - initialization failure
-            self._face_mesh = None
-            raise RuntimeError("Unable to initialize MediaPipe Face Mesh.") from exc
+        self._face_mesh = _create_face_mesh_for_config(self.config, static_image_mode=False)
 
     def _rebuild_body_segmenter(self) -> None:
         if self._body_segmenter is not None:
@@ -1348,13 +2082,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         if not self.config.enable_body_mask:
             return
 
-        try:
-            self._body_segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
-                model_selection=int(np.clip(self.config.segmentation_model_selection, 0, 1))
-            )
-        except Exception as exc:  # pragma: no cover - initialization failure
-            self._body_segmenter = None
-            raise RuntimeError("Unable to initialize MediaPipe Selfie Segmentation.") from exc
+        self._body_segmenter = _create_body_segmenter_for_config(self.config)
 
     def _on_detection_conf_changed(self, slider_value: int) -> None:
         slider_value = int(np.clip(slider_value, self._det_conf_slider.minimum(), self._det_conf_slider.maximum()))
@@ -1894,6 +2622,13 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt overrides)
         self._persist_settings()
+        if self._pdf_worker is not None:
+            self._pdf_worker.cancel()
+        if self._pdf_thread is not None and self._pdf_thread.isRunning():
+            self._pdf_thread.quit()
+            self._pdf_thread.wait(3000)
+        self._pdf_thread = None
+        self._pdf_worker = None
         self._timer.stop()
         if self._face_mesh is not None:
             self._face_mesh.close()
@@ -1975,46 +2710,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         frame: np.ndarray,
         mesh: mp.solutions.face_mesh.FaceMesh | None,
     ) -> np.ndarray:
-        height, width = frame.shape[:2]
-        if height == 0 or width == 0:
-            return frame
-        if mesh is None:
-            return frame
-
-        frame.flags.writeable = False
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = mesh.process(rgb_frame)
-        frame.flags.writeable = True
-
-        if not getattr(results, "multi_face_landmarks", None):
-            return frame
-
-        color = self.config.mask_color
-        alpha = float(np.clip(self.config.mask_alpha, 0.0, 1.0))
-        border = max(self.config.border_thickness, 0)
-
-        polygons = list(self._generate_face_polygons(results.multi_face_landmarks, width, height))
-        if not polygons:
-            return frame
-
-        if alpha >= 0.999:
-            for polygon in polygons:
-                cv2.fillPoly(frame, [polygon], color)
-                if border > 0:
-                    cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=border)
-            return frame
-
-        overlay = frame.copy()
-        for polygon in polygons:
-            cv2.fillPoly(overlay, [polygon], color)
-
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
-
-        if border > 0:
-            for polygon in polygons:
-                cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=border)
-
-        return frame
+        return _apply_face_mask_to_frame(frame, self.config, mesh)
 
     def _annotate_body_with_segmenter(
         self,
@@ -2022,58 +2718,9 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None,
         buffer_attribute: str,
     ) -> np.ndarray:
-        if segmenter is None:
-            return frame
-
-        height, width = frame.shape[:2]
-        if height == 0 or width == 0:
-            return frame
-
-        frame.flags.writeable = False
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = segmenter.process(rgb_frame)
-        frame.flags.writeable = True
-
-        segmentation_mask: Optional[np.ndarray] = getattr(results, "segmentation_mask", None)
-        if segmentation_mask is None:
-            setattr(self, buffer_attribute, None)
-            return frame
-
-        mask_prob = np.asarray(segmentation_mask, dtype=np.float32)
         buffer_value: Optional[np.ndarray] = getattr(self, buffer_attribute, None)
-        smooth_factor = float(np.clip(self.config.segmentation_smooth_factor, 0.0, 0.99))
-        if smooth_factor > 0 and buffer_value is not None:
-            mask_prob = smooth_factor * buffer_value + (1.0 - smooth_factor) * mask_prob
-
-        kernel_size = max(int(self.config.segmentation_kernel_size), 1)
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        if kernel_size >= 3:
-            mask_prob = cv2.GaussianBlur(mask_prob, (kernel_size, kernel_size), sigmaX=0, sigmaY=0)
-        mask_prob = np.clip(mask_prob, 0.0, 1.0)
-        setattr(self, buffer_attribute, mask_prob.copy())
-
-        threshold = float(np.clip(self.config.segmentation_threshold, 0.0, 1.0))
-        mask = mask_prob > threshold
-        if mask.any() and kernel_size >= 3:
-            kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-            mask_uint8 = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel, iterations=1)
-            mask = mask_uint8.astype(bool)
-
-        if not np.any(mask):
-            setattr(self, buffer_attribute, None)
-            return frame
-
-        color = np.array(self.config.mask_color, dtype=np.float32)
-        alpha = float(np.clip(self.config.mask_alpha, 0.0, 1.0))
-
-        if alpha >= 0.999:
-            frame[mask] = color.astype(np.uint8)
-            return frame
-
-        existing = frame[mask].astype(np.float32)
-        blended = alpha * color + (1.0 - alpha) * existing
-        frame[mask] = blended.clip(0, 255).astype(np.uint8)
+        frame, updated_buffer = _apply_body_mask_to_frame(frame, self.config, segmenter, buffer_value)
+        setattr(self, buffer_attribute, updated_buffer)
         return frame
 
     def _generate_face_polygons(
