@@ -10,6 +10,7 @@ import cv2
 import fitz
 import mediapipe as mp
 import numpy as np
+from mediapipe.framework.formats import location_data_pb2
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from .config import DetectionConfig
@@ -56,6 +57,8 @@ _FACE_OVAL_LANDMARKS: Tuple[int, ...] = (
 
 _PERSISTED_FIELDS: Tuple[str, ...] = (
     "enable_face_mask",
+    "enable_small_face_detector",
+    "process_embedded_images",
     "enable_body_mask",
     "detection_confidence",
     "tracking_confidence",
@@ -96,6 +99,22 @@ def _create_face_mesh_for_config(
         )
     except Exception as exc:  # pragma: no cover - initialization failure
         raise RuntimeError("Unable to initialize MediaPipe Face Mesh.") from exc
+
+
+def _create_face_detector_for_config(
+    config: DetectionConfig,
+) -> mp.solutions.face_detection.FaceDetection | None:
+    if not (config.enable_face_mask and config.enable_small_face_detector):
+        return None
+
+    min_conf = float(np.clip(config.detection_confidence, 0.0, 1.0))
+    try:
+        return mp.solutions.face_detection.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=min_conf,
+        )
+    except Exception as exc:  # pragma: no cover - initialization failure
+        raise RuntimeError("Unable to initialize MediaPipe Face Detection.") from exc
 
 
 def _create_body_segmenter_for_config(
@@ -166,6 +185,102 @@ def _apply_face_mask_to_frame(
     if border > 0:
         for polygon in polygons:
             cv2.polylines(frame, [polygon], isClosed=True, color=color, thickness=border)
+
+    return frame
+
+
+def _apply_small_face_mask_to_frame(
+    frame: np.ndarray,
+    config: DetectionConfig,
+    detector: mp.solutions.face_detection.FaceDetection | None,
+) -> np.ndarray:
+    height, width = frame.shape[:2]
+    if (
+        height == 0
+        or width == 0
+        or detector is None
+        or not config.enable_face_mask
+        or not config.enable_small_face_detector
+    ):
+        return frame
+
+    frame.flags.writeable = False
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    upscale_factor = 1.5
+    max_edge = max(height, width)
+    if max_edge * upscale_factor > 2048:
+        upscale_factor = max(1.0, 2048 / max_edge)
+    if upscale_factor > 1.05:
+        resized_rgb = cv2.resize(
+            rgb_frame,
+            dsize=(int(width * upscale_factor), int(height * upscale_factor)),
+            interpolation=cv2.INTER_CUBIC,
+        )
+    else:
+        resized_rgb = rgb_frame
+
+    results = detector.process(resized_rgb)
+    frame.flags.writeable = True
+
+    detections = getattr(results, "detections", None)
+    if not detections:
+        return frame
+
+    color = config.mask_color
+    alpha = float(np.clip(config.mask_alpha, 0.0, 1.0))
+    border = max(config.border_thickness, 0)
+
+    overlay: Optional[np.ndarray] = None
+    ellipses: list[tuple[tuple[int, int], tuple[int, int]]] = []
+
+    for detection in detections:
+        location = getattr(detection, "location_data", None)
+        if (
+            location is None
+            or location.format != location_data_pb2.LocationData.RELATIVE_BOUNDING_BOX
+        ):
+            continue
+
+        relative_box = location.relative_bounding_box
+        width_ratio = float(relative_box.width)
+        height_ratio = float(relative_box.height)
+        if width_ratio <= 0 or height_ratio <= 0:
+            continue
+
+        xmin = float(relative_box.xmin)
+        ymin = float(relative_box.ymin)
+
+        center_x = (xmin + width_ratio / 2.0) * width
+        center_y = (ymin + height_ratio / 2.0) * height
+
+        half_width = width_ratio * width * 0.5
+        half_height = height_ratio * height * 0.5
+
+        axis_x = max(int(round(half_width * 1.45)), 2)
+        axis_y = max(int(round(half_height * 1.65)), 2)
+
+        if axis_x < 3 or axis_y < 3:
+            continue
+
+        clipped_center = (
+            int(np.clip(center_x, 0, max(width - 1, 0))),
+            int(np.clip(center_y, 0, max(height - 1, 0))),
+        )
+        ellipses.append((clipped_center, (axis_x, axis_y)))
+
+        if alpha >= 0.999:
+            cv2.ellipse(frame, clipped_center, (axis_x, axis_y), 0, 0, 360, color, -1)
+        else:
+            if overlay is None:
+                overlay = frame.copy()
+            cv2.ellipse(overlay, clipped_center, (axis_x, axis_y), 0, 0, 360, color, -1)
+
+    if alpha < 0.999 and overlay is not None:
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, dst=frame)
+
+    if border > 0 and ellipses:
+        for center, axes in ellipses:
+            cv2.ellipse(frame, center, axes, 0, 0, 360, color, border)
 
     return frame
 
@@ -248,6 +363,115 @@ def _encode_bgr_image(frame: np.ndarray) -> bytes:
     return encoded.tobytes()
 
 
+def _decode_image_bytes(image_bytes: bytes) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    buffer = np.frombuffer(image_bytes, dtype=np.uint8)
+    decoded = cv2.imdecode(buffer, cv2.IMREAD_UNCHANGED)
+    if decoded is None or decoded.size == 0:
+        return None, None
+
+    alpha_channel: Optional[np.ndarray] = None
+    if decoded.ndim == 2:
+        color = cv2.cvtColor(decoded, cv2.COLOR_GRAY2BGR)
+    elif decoded.ndim == 3 and decoded.shape[2] == 4:
+        alpha_channel = decoded[:, :, 3].copy()
+        color = decoded[:, :, :3]
+    elif decoded.ndim == 3 and decoded.shape[2] == 3:
+        color = decoded
+    else:
+        return None, None
+    return color, alpha_channel
+
+
+def _encode_image_with_optional_alpha(frame: np.ndarray, alpha: Optional[np.ndarray]) -> bytes:
+    if alpha is not None:
+        if frame.shape[:2] != alpha.shape[:2]:
+            raise RuntimeError("Alpha channel shape mismatch while encoding image.")
+        merged = np.dstack((frame, alpha))
+        success, encoded = cv2.imencode(".png", merged)
+    else:
+        success, encoded = cv2.imencode(".png", frame)
+    if not success:
+        raise RuntimeError("Unable to encode sanitized embedded image.")
+    return encoded.tobytes()
+
+
+def _apply_masks_to_still_frame(
+    frame: np.ndarray,
+    config: DetectionConfig,
+    face_mesh: mp.solutions.face_mesh.FaceMesh | None,
+    body_segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None,
+    face_detector: mp.solutions.face_detection.FaceDetection | None,
+) -> np.ndarray:
+    result = frame.copy()
+    if config.enable_body_mask:
+        result, _ = _apply_body_mask_to_frame(result, config, body_segmenter, None)
+    if config.enable_face_mask:
+        result = _apply_face_mask_to_frame(result, config, face_mesh)
+        result = _apply_small_face_mask_to_frame(result, config, face_detector)
+    return result
+
+
+def _sanitize_page_images(
+    doc: fitz.Document,
+    page: fitz.Page,
+    config: DetectionConfig,
+    face_mesh: mp.solutions.face_mesh.FaceMesh | None,
+    body_segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None,
+    face_detector: mp.solutions.face_detection.FaceDetection | None,
+) -> int:
+    if not config.process_embedded_images:
+        return 0
+
+    try:
+        image_entries = page.get_images(full=True)
+    except Exception:
+        return 0
+
+    if not image_entries:
+        return 0
+
+    sanitized = 0
+    processed_xrefs: set[int] = set()
+
+    for entry in image_entries:
+        if not entry:
+            continue
+        xref = entry[0]
+        if xref in processed_xrefs:
+            continue
+        processed_xrefs.add(xref)
+        try:
+            extracted = doc.extract_image(xref)
+        except Exception:
+            continue
+
+        image_bytes = extracted.get("image")
+        if not image_bytes:
+            continue
+
+        color, alpha = _decode_image_bytes(image_bytes)
+        if color is None:
+            continue
+
+        processed = _apply_masks_to_still_frame(color, config, face_mesh, body_segmenter, face_detector)
+        if np.array_equal(processed, color):
+            continue
+
+        try:
+            encoded = _encode_image_with_optional_alpha(processed, alpha)
+        except RuntimeError:
+            continue
+
+        try:
+            doc.update_image(xref, stream=encoded)
+        except Exception:
+            continue
+
+        sanitized += 1
+
+    return sanitized
+
+
 def _parse_page_selection(spec: str, total_pages: int) -> list[int]:
     cleaned = spec.strip()
     if not cleaned:
@@ -328,6 +552,7 @@ class PdfProcessWorker(QtCore.QObject):
         doc = fitz.open(self._input_path)
         face_mesh: mp.solutions.face_mesh.FaceMesh | None = None
         body_segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None = None
+        face_detector: mp.solutions.face_detection.FaceDetection | None = None
         out_doc: fitz.Document | None = None
 
         try:
@@ -347,6 +572,7 @@ class PdfProcessWorker(QtCore.QObject):
 
             face_mesh = _create_face_mesh_for_config(self._config, static_image_mode=True)
             body_segmenter = _create_body_segmenter_for_config(self._config)
+            face_detector = _create_face_detector_for_config(self._config)
             matrix = fitz.Matrix(self._scale, self._scale)
 
             out_doc = fitz.open()
@@ -363,9 +589,23 @@ class PdfProcessWorker(QtCore.QObject):
                     out_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
                     continue
 
+                sanitized_images = _sanitize_page_images(
+                    doc,
+                    page,
+                    self._config,
+                    face_mesh,
+                    body_segmenter,
+                    face_detector,
+                )
+                if sanitized_images > 0:
+                    self.message.emit(
+                        f"Page {page_index + 1}/{page_count}: sanitized {sanitized_images} embedded image(s)"
+                    )
+
                 frame = _render_page_to_bgr(page, matrix)
                 frame, _ = _apply_body_mask_to_frame(frame, self._config, body_segmenter, None)
                 frame = _apply_face_mask_to_frame(frame, self._config, face_mesh)
+                frame = _apply_small_face_mask_to_frame(frame, self._config, face_detector)
 
                 image_stream = _encode_bgr_image(frame)
                 new_page = out_doc.new_page(width=page.rect.width, height=page.rect.height)
@@ -391,6 +631,8 @@ class PdfProcessWorker(QtCore.QObject):
                 face_mesh.close()
             if body_segmenter is not None:
                 body_segmenter.close()
+            if face_detector is not None:
+                face_detector.close()
             doc.close()
 
 
@@ -444,6 +686,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._segmentation_mask_buffer: Optional[np.ndarray] = None
         self._image_segmentation_mask_buffer: Optional[np.ndarray] = None
         self._face_mesh: mp.solutions.face_mesh.FaceMesh | None = None
+        self._face_detector: mp.solutions.face_detection.FaceDetection | None = None
         self._body_segmenter: mp.solutions.selfie_segmentation.SelfieSegmentation | None = None
         self._settings_file: Optional[Path] = None
         self._latest_frame: Optional[np.ndarray] = None
@@ -468,6 +711,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._image_clear_button: QtWidgets.QPushButton | None = None
         self._image_open_button: QtWidgets.QPushButton | None = None
         self._image_toolbar: QtWidgets.QWidget | None = None
+        self._small_face_checkbox: QtWidgets.QCheckBox | None = None
         self._paste_shortcut: QtWidgets.QShortcut | None = None
         self._open_image_shortcut: QtWidgets.QShortcut | None = None
         self._save_image_shortcut: QtWidgets.QShortcut | None = None
@@ -480,6 +724,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._pdf_path_display: QtWidgets.QLineEdit | None = None
         self._pdf_page_entry: QtWidgets.QLineEdit | None = None
         self._pdf_resolution_combo: QtWidgets.QComboBox | None = None
+        self._pdf_image_checkbox: QtWidgets.QCheckBox | None = None
         self._pdf_process_button: QtWidgets.QPushButton | None = None
         self._pdf_cancel_button: QtWidgets.QPushButton | None = None
         self._pdf_progress_bar: QtWidgets.QProgressBar | None = None
@@ -510,8 +755,14 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             raise RuntimeError("Unable to access camera. Check that no other application is using it.")
 
         try:
-            self._rebuild_face_mesh()
+            self._rebuild_face_components()
         except RuntimeError:
+            if self._face_mesh is not None:
+                self._face_mesh.close()
+                self._face_mesh = None
+            if self._face_detector is not None:
+                self._face_detector.close()
+                self._face_detector = None
             if self._camera.isOpened():
                 self._camera.release()
             raise
@@ -522,6 +773,9 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             if self._face_mesh is not None:
                 self._face_mesh.close()
                 self._face_mesh = None
+            if self._face_detector is not None:
+                self._face_detector.close()
+                self._face_detector = None
             if self._camera.isOpened():
                 self._camera.release()
             raise
@@ -782,6 +1036,14 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._pdf_resolution_combo.addItem("Studio (216 dpi)", 216 / 72)
         self._pdf_resolution_combo.setCurrentIndex(1)
         options_form.addRow("Render quality", self._pdf_resolution_combo)
+
+        self._pdf_image_checkbox = QtWidgets.QCheckBox("Sanitize embedded images", options_group)
+        self._pdf_image_checkbox.setChecked(self.config.process_embedded_images)
+        self._pdf_image_checkbox.toggled.connect(self._on_pdf_embedded_images_toggled)
+        self._pdf_image_checkbox.setToolTip(
+            "Traverse each embedded raster image and run the anonymizer at the image's native resolution."
+        )
+        options_form.addRow("Embedded images", self._pdf_image_checkbox)
 
         layout.addWidget(options_group)
 
@@ -1097,7 +1359,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
                 "_image_segmentation_mask_buffer",
             )
         if self.config.enable_face_mask:
-            result = self._annotate_faces_with_mesh(result, self._face_mesh)
+            result = self._annotate_faces(result)
         return result
 
     def _activate_pdf_mode(self) -> None:
@@ -1152,15 +1414,33 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
     def _on_pdf_options_changed(self, _: str) -> None:
         self._update_pdf_controls_state()
 
+    def _on_pdf_embedded_images_toggled(self, checked: bool) -> None:
+        if checked == self.config.process_embedded_images:
+            return
+
+        self.config.process_embedded_images = checked
+        status = "Embedded image pass enabled" if checked else "Embedded image pass disabled"
+        self._status_label.setText(status)
+        self._append_pdf_log(status)
+        self._persist_settings()
+
     def _update_pdf_controls_state(self) -> None:
         has_path = self._pdf_input_path is not None and self._pdf_input_path.exists()
         worker_active = self._pdf_worker is not None
 
-        for widget in (self._pdf_open_button, self._pdf_page_entry, self._pdf_resolution_combo, self._pdf_process_button):
+        for widget in (
+            self._pdf_open_button,
+            self._pdf_page_entry,
+            self._pdf_resolution_combo,
+            self._pdf_image_checkbox,
+            self._pdf_process_button,
+        ):
             if widget is None:
                 continue
             if widget is self._pdf_process_button:
                 widget.setEnabled(has_path and not worker_active)
+            elif widget is self._pdf_image_checkbox:
+                widget.setEnabled(not worker_active)
             else:
                 widget.setEnabled(not worker_active)
 
@@ -1465,6 +1745,14 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._body_mask_checkbox.toggled.connect(self._on_body_mask_toggled)
         self._body_mask_checkbox.setToolTip("Fill the segmented body area with the chosen color.")
         mask_layout.addWidget(self._body_mask_checkbox)
+
+        self._small_face_checkbox = QtWidgets.QCheckBox("Tiny face booster", mask_group)
+        self._small_face_checkbox.setChecked(self.config.enable_small_face_detector)
+        self._small_face_checkbox.toggled.connect(self._on_small_face_toggled)
+        self._small_face_checkbox.setToolTip(
+            "Run an extra detection pass to catch tiny faces inside high-resolution documents."
+        )
+        mask_layout.addWidget(self._small_face_checkbox)
         mask_layout.addStretch(1)
         panel_layout.addWidget(mask_group)
 
@@ -1810,14 +2098,14 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         previous = self.config.max_faces
         self.config.max_faces = clamped
         try:
-            self._rebuild_face_mesh()
+            self._rebuild_face_components()
         except RuntimeError as exc:
             self.config.max_faces = previous
             self._max_faces_spin.blockSignals(True)
             self._max_faces_spin.setValue(previous)
             self._max_faces_spin.blockSignals(False)
             try:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             except RuntimeError:
                 pass
             self._status_label.setText(str(exc))
@@ -1891,6 +2179,11 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         self._body_mask_checkbox.blockSignals(True)
         self._body_mask_checkbox.setChecked(self.config.enable_body_mask)
         self._body_mask_checkbox.blockSignals(False)
+
+        if self._small_face_checkbox is not None:
+            self._small_face_checkbox.blockSignals(True)
+            self._small_face_checkbox.setChecked(self.config.enable_small_face_detector)
+            self._small_face_checkbox.blockSignals(False)
 
         self.config.detection_confidence = self._set_slider_float(
             self._det_conf_slider,
@@ -1987,6 +2280,11 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
         self._update_control_states()
 
+        if self._pdf_image_checkbox is not None:
+            self._pdf_image_checkbox.blockSignals(True)
+            self._pdf_image_checkbox.setChecked(self.config.process_embedded_images)
+            self._pdf_image_checkbox.blockSignals(False)
+
     def _set_slider_float(
         self,
         slider: QtWidgets.QSlider,
@@ -2030,6 +2328,8 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             widget.setEnabled(face_enabled)
         if hasattr(self, "_max_faces_spin") and self._max_faces_spin is not None:
             self._max_faces_spin.setEnabled(face_enabled)
+        if self._small_face_checkbox is not None:
+            self._small_face_checkbox.setEnabled(face_enabled)
 
         body_enabled = self.config.enable_body_mask
         for widget in (
@@ -2061,6 +2361,10 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
     def _reset_image_segmentation_buffer(self) -> None:
         self._image_segmentation_mask_buffer = None
 
+    def _rebuild_face_components(self) -> None:
+        self._rebuild_face_mesh()
+        self._rebuild_face_detector()
+
     def _rebuild_face_mesh(self) -> None:
         if self._face_mesh is not None:
             self._face_mesh.close()
@@ -2070,6 +2374,16 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             return
 
         self._face_mesh = _create_face_mesh_for_config(self.config, static_image_mode=False)
+
+    def _rebuild_face_detector(self) -> None:
+        if self._face_detector is not None:
+            self._face_detector.close()
+            self._face_detector = None
+
+        if not (self.config.enable_face_mask and self.config.enable_small_face_detector):
+            return
+
+        self._face_detector = _create_face_detector_for_config(self.config)
 
     def _rebuild_body_segmenter(self) -> None:
         if self._body_segmenter is not None:
@@ -2094,7 +2408,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         previous = self.config.detection_confidence
         self.config.detection_confidence = value
         try:
-            self._rebuild_face_mesh()
+            self._rebuild_face_components()
         except RuntimeError as exc:
             self.config.detection_confidence = previous
             self._det_conf_slider.blockSignals(True)
@@ -2102,7 +2416,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             self._det_conf_slider.blockSignals(False)
             self._det_conf_value.setText(f"{previous:.2f}")
             try:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             except RuntimeError:
                 pass
             self._status_label.setText(str(exc))
@@ -2121,7 +2435,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         previous = self.config.tracking_confidence
         self.config.tracking_confidence = value
         try:
-            self._rebuild_face_mesh()
+            self._rebuild_face_components()
         except RuntimeError as exc:
             self.config.tracking_confidence = previous
             self._track_conf_slider.blockSignals(True)
@@ -2129,7 +2443,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             self._track_conf_slider.blockSignals(False)
             self._track_conf_value.setText(f"{previous:.2f}")
             try:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             except RuntimeError:
                 pass
             self._status_label.setText(str(exc))
@@ -2224,6 +2538,9 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             if self._face_mesh is not None:
                 self._face_mesh.close()
                 self._face_mesh = None
+            if self._face_detector is not None:
+                self._face_detector.close()
+                self._face_detector = None
             self._update_control_states()
             self._status_label.setText("Face mask disabled")
             self._persist_settings()
@@ -2232,7 +2549,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
         self.config.enable_face_mask = True
         try:
-            self._rebuild_face_mesh()
+            self._rebuild_face_components()
         except RuntimeError as exc:
             self.config.enable_face_mask = False
             self._face_mask_checkbox.blockSignals(True)
@@ -2240,13 +2557,36 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             self._face_mask_checkbox.blockSignals(False)
             self._update_control_states()
             try:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             except RuntimeError:
                 pass
             self._status_label.setText(str(exc))
             return
         self._update_control_states()
         self._status_label.setText("Face mask enabled")
+        self._persist_settings()
+        self._refresh_image_preview()
+
+    def _on_small_face_toggled(self, checked: bool) -> None:
+        if checked == self.config.enable_small_face_detector:
+            return
+
+        previous = self.config.enable_small_face_detector
+        self.config.enable_small_face_detector = checked
+        try:
+            self._rebuild_face_detector()
+        except RuntimeError as exc:
+            self.config.enable_small_face_detector = previous
+            if self._small_face_checkbox is not None:
+                self._small_face_checkbox.blockSignals(True)
+                self._small_face_checkbox.setChecked(previous)
+                self._small_face_checkbox.blockSignals(False)
+            self._status_label.setText(str(exc))
+            return
+
+        self._status_label.setText(
+            "Tiny face booster enabled" if checked else "Tiny face booster disabled"
+        )
         self._persist_settings()
         self._refresh_image_preview()
 
@@ -2341,6 +2681,15 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         if face_mask is not None and face_mask != self.config.enable_face_mask:
             self.config.enable_face_mask = face_mask
             face_rebuild = True
+
+        small_face = self._coerce_bool(data.get("enable_small_face_detector"))
+        if small_face is not None and small_face != self.config.enable_small_face_detector:
+            self.config.enable_small_face_detector = small_face
+            face_rebuild = True
+
+        embedded_images = self._coerce_bool(data.get("process_embedded_images"))
+        if embedded_images is not None and embedded_images != self.config.process_embedded_images:
+            self.config.process_embedded_images = embedded_images
 
         body_mask = self._coerce_bool(data.get("enable_body_mask"))
         if body_mask is not None and body_mask != self.config.enable_body_mask:
@@ -2451,7 +2800,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
         try:
             if face_changed:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             if body_changed:
                 self._rebuild_body_segmenter()
             elif reset_buffer:
@@ -2463,7 +2812,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             revert_face, revert_body, revert_reset, revert_fps = self._update_config_from_mapping(previous)
             try:
                 if revert_face:
-                    self._rebuild_face_mesh()
+                    self._rebuild_face_components()
             except RuntimeError:
                 pass
             try:
@@ -2517,7 +2866,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
 
         try:
             if face_changed:
-                self._rebuild_face_mesh()
+                self._rebuild_face_components()
             if body_changed:
                 self._rebuild_body_segmenter()
             elif reset_buffer:
@@ -2529,7 +2878,7 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
             revert_face, revert_body, revert_reset, revert_fps = self._update_config_from_mapping(previous)
             try:
                 if revert_face:
-                    self._rebuild_face_mesh()
+                    self._rebuild_face_components()
             except RuntimeError:
                 pass
             try:
@@ -2633,6 +2982,9 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         if self._face_mesh is not None:
             self._face_mesh.close()
             self._face_mesh = None
+        if getattr(self, "_face_detector", None) is not None:
+            self._face_detector.close()
+            self._face_detector = None
         if getattr(self, "_body_segmenter", None) is not None:
             self._body_segmenter.close()
             self._body_segmenter = None
@@ -2700,7 +3052,8 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         return frame
 
     def _annotate_faces(self, frame: np.ndarray) -> np.ndarray:
-        return self._annotate_faces_with_mesh(frame, self._face_mesh)
+        annotated = self._annotate_faces_with_mesh(frame, self._face_mesh)
+        return self._annotate_faces_with_detector(annotated, self._face_detector)
 
     def _annotate_body(self, frame: np.ndarray) -> np.ndarray:
         return self._annotate_body_with_segmenter(frame, self._body_segmenter, "_segmentation_mask_buffer")
@@ -2711,6 +3064,13 @@ class FaceDetectionWindow(QtWidgets.QMainWindow):
         mesh: mp.solutions.face_mesh.FaceMesh | None,
     ) -> np.ndarray:
         return _apply_face_mask_to_frame(frame, self.config, mesh)
+
+    def _annotate_faces_with_detector(
+        self,
+        frame: np.ndarray,
+        detector: mp.solutions.face_detection.FaceDetection | None,
+    ) -> np.ndarray:
+        return _apply_small_face_mask_to_frame(frame, self.config, detector)
 
     def _annotate_body_with_segmenter(
         self,

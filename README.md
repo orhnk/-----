@@ -8,6 +8,8 @@ A PyQt5-based desktop application that streams frames from your laptop camera, d
 - Built-in GUI control panel to fine-tune accuracy parameters (confidence, smoothing, kernel size, model choice) while the stream is running
 - Quick import/export, reset, and automatic persistence of your preferred accuracy settings between sessions
 - Configurable camera index, refresh rate, mask opacity, mask color, and face-count/confidence thresholds
+- Optional "tiny face booster" pass that scans high-resolution PDFs and static images for small, embedded faces (toggleable in the GUI or CLI)
+- Embedded PDF image sanitization that runs the anonymizer on every embedded raster at its native resolution, catching faces hidden inside thumbnails or diagrams
 - Simple, responsive PyQt5 GUI with status messages
 - Packaged with [Nix flakes](https://nixos.wiki/wiki/Flakes) for reproducible builds and development shells
 
@@ -56,6 +58,8 @@ python -m face_gui.app
 | `--min-detection-confidence` | Minimum detection confidence threshold passed to MediaPipe (0–1). Default `0.5`. |
 | `--min-tracking-confidence` | Minimum tracking confidence threshold for temporal smoothing (0–1). Default `0.5`. |
 | `--disable-face-mask` | Skip drawing the face polygon mask (useful for body-only masking). |
+| `--disable-small-face-detector` | Skip the supplemental detector that hunts for tiny faces inside PDFs and static images. |
+| `--disable-embedded-image-pass` | Skip scanning embedded images; only the page-level render will be anonymized. |
 | `--disable-body-mask` | Skip drawing the body segmentation mask. |
 | `--segmentation-threshold` | Confidence threshold (0–1) for accepting body pixels. Default `0.5`. |
 | `--segmentation-model` | MediaPipe Selfie Segmentation model index (`0` or `1`). Default `1`. |
@@ -65,6 +69,8 @@ python -m face_gui.app
 ### Improving accuracy
 
 - Use the settings panel on the right side of the window to tweak the same parameters live without restarting the app.
+- When dealing with documents full of postage-sized portraits, enable the **Tiny face booster** checkbox (or leave it on by default) to run an extra detector pass that covers those micro faces.
+- For PDFs packed with photos or diagrams, keep **Sanitize embedded images** enabled so every raster gets anonymized at its full native resolution before the page is flattened.
 - For close-up users, try `--segmentation-model 0`; for wider scenes, keep the (landscape) default `1`.
 - Increase `--segmentation-smooth-factor` (e.g. `0.8`) to suppress flicker when subjects move slowly. Lower it for faster response.
 - Adjust `--segmentation-kernel-size` to fill gaps (larger) or recover detail (smaller). Values must be odd; `7`–`11` works well for upper-body crops.

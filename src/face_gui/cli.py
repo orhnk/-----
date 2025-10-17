@@ -56,6 +56,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the face polygon mask overlay.",
     )
     parser.add_argument(
+        "--disable-small-face-detector",
+        action="store_true",
+        help="Disable the supplemental detector used to catch tiny faces inside PDFs and images.",
+    )
+    parser.add_argument(
+        "--disable-embedded-image-pass",
+        action="store_true",
+        help="Skip anonymizing embedded images inside PDFs (only render-level processing will run).",
+    )
+    parser.add_argument(
         "--disable-body-mask",
         action="store_true",
         help="Disable the body segmentation mask overlay.",
@@ -102,6 +112,8 @@ def parse_args(argv: Sequence[str]) -> DetectionConfig:
         detection_confidence=_clamp(namespace.min_detection_confidence, 0.0, 1.0),
         tracking_confidence=_clamp(namespace.min_tracking_confidence, 0.0, 1.0),
         enable_face_mask=not namespace.disable_face_mask,
+    enable_small_face_detector=not namespace.disable_small_face_detector,
+    process_embedded_images=not namespace.disable_embedded_image_pass,
         enable_body_mask=not namespace.disable_body_mask,
         segmentation_threshold=_clamp(namespace.segmentation_threshold, 0.0, 1.0),
         segmentation_model_selection=int(namespace.segmentation_model),

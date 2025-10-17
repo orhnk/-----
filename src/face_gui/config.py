@@ -22,6 +22,8 @@ class DetectionConfig:
     segmentation_model_selection: int = 1
     segmentation_smooth_factor: float = 0.6
     segmentation_kernel_size: int = 7
+    enable_small_face_detector: bool = True
+    process_embedded_images: bool = True
 
 
 __all__ = ["DetectionConfig", "MaskColor"]
