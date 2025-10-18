@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Musettir
+Comment=Live face detection GUI using PyQt5 and OpenCV
+Exec=musettir
+Icon=camera-photo
+Categories=Graphics;Video;
+Terminal=false

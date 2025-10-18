@@ -130,10 +130,46 @@
             exec ${musettirApp}/bin/musettir "$@"
           '';
         };
+
+        # Create a package with desktop entry for system integration
+        musettirPackage = pkgs.stdenv.mkDerivation {
+          pname = "musettir";
+          version = "0.1.0";
+          
+          dontUnpack = true;
+          dontBuild = true;
+
+          installPhase = ''
+            mkdir -p $out/bin
+            mkdir -p $out/share/applications
+            mkdir -p $out/share/pixmaps
+            
+            cp ${faceGuiApp}/bin/musettir $out/bin/musettir
+            chmod +x $out/bin/musettir
+            
+            # Install desktop entry
+            cat > $out/share/applications/musettir.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Musettir
+Comment=Live face detection GUI using PyQt5 and OpenCV
+Exec=$out/bin/musettir
+Icon=camera-photo
+Categories=Graphics;Video;
+Terminal=false
+EOF
+          '';
+
+          meta = with pkgs.lib; {
+            description = "Live face detection GUI using PyQt5 and OpenCV";
+            license = licenses.gpl3;
+            platforms = platforms.linux;
+          };
+        };
       in {
         packages = {
-          default = faceGuiApp;
-          musettir = faceGuiApp;
+          default = musettirPackage;
+          musettir = musettirPackage;
         };
 
         apps.default = {
