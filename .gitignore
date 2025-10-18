@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Nix
+result
+result-bin
+.dirlocal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.Thumbs.db
+
+# Environment
+.env
+.venv
+venv/
+
+# Build artifacts
+*.whl
+*.tar.gz

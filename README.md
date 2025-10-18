@@ -32,6 +32,20 @@ You can pass command-line options through `--`, for example to use camera index 
 nix run -- --camera 1 --mask-color 255,0,0 --max-faces 3
 ```
 
+### Install it system-wide with flakes
+
+Add the packaged app to your Nix profile so it is always available:
+
+```fish
+nix profile install .#musettir
+```
+
+After that you can launch it with:
+
+```fish
+musettir
+```
+
 ## Development shell
 
 Enter a shell with Python, OpenCV, and PyQt5 available:
@@ -43,7 +57,7 @@ nix develop
 Once inside, you can run the application manually:
 
 ```fish
-python -m face_gui.app
+python -m musettir.app
 ```
 
 ## Command-line options
@@ -78,7 +92,7 @@ python -m face_gui.app
 
 ### Settings management
 
-- The GUI slider panel mirrors the command-line options and automatically saves your latest choices under `~/.face_gui/settings.json` (or the OS-specific config directory) when you change them.
+- The GUI slider panel mirrors the command-line options and automatically saves your latest choices under `~/.musettir/settings.json` (or the OS-specific config directory) when you change them.
 - Use the **Import…** and **Export…** buttons to store or reload JSON snapshots of these settings across machines.
 - Hit **Reset** whenever you want to return to the default detection and segmentation parameters.
 
@@ -89,7 +103,7 @@ python -m face_gui.app
 ├── flake.nix          # Nix flake definition for builds and dev shells
 ├── pyproject.toml     # Python project metadata and dependencies
 ├── README.md          # This documentation
-└── src/face_gui/
+└── src/musettir/
     ├── __init__.py
     └── app.py         # PyQt application entry point
 ```
